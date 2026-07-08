@@ -1,0 +1,21 @@
+node_modules/
+dist/
+
+# secrets
+.env
+.env.local
+
+# per-run/per-client artifacts (keep folders, ignore contents)
+auth-state/*
+!auth-state/.gitkeep
+
+tmp/*
+!tmp/.gitkeep
+
+logs/*
+!logs/.gitkeep
+
+# misc
+*.log
+.DS_Store
+Thumbs.db

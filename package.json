@@ -1,0 +1,31 @@
+{
+  "name": "restaurant-depot-scraper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Node.js/Playwright port of the Restaurant Depot receipt-intake Apify actor.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dry": "cross-env DRY_RUN=true tsx src/index.ts",
+    "one": "tsx src/index.ts",
+    "test-login": "cross-env TEST_LOGIN=true tsx src/index.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "googleapis": "^144.0.0",
+    "playwright": "^1.55.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "cross-env": "^7.0.3",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true
+  }
+}
