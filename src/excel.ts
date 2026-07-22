@@ -104,24 +104,69 @@ export function parseInvoiceExcel(localPath: string): ParsedInvoice | null {
       return isNaN(n) ? 0 : n;
     };
 
+    // Detect column mapping once, log so we can verify against real RD xlsx.
+    // Restaurant Depot receipts have separate "Unit Qty" and "Case Qty" columns —
+    // the OLD code's /\bqty\b/ regex matched "Unit Qty" first and never read Case Qty,
+    // which is why case-sold items (milk, cream, cauliflower) showed qty=0 and total=$0.
+    const firstRowKeys = Object.keys(jsonRows[0] ?? {});
+    const unitQtyKey = firstRowKeys.find((k) => /unit.?qty|unit.?quantity/i.test(k));
+    const caseQtyKey = firstRowKeys.find((k) => /case.?qty|case.?quantity/i.test(k));
+    const priceKey = firstRowKeys.find((k) => /\bprice\b|unit.?cost|\bcost\b/i.test(k));
+    const totalKey = firstRowKeys.find((k) => /\btotal\b|extended|\bamount\b|line.?total|row.?total/i.test(k));
+    const descKey = firstRowKeys.find((k) => /desc|item|product|name/i.test(k));
+    // Fallback for non-RD invoice formats that only have a generic "qty" column
+    const genericQtyKey = !unitQtyKey && !caseQtyKey
+      ? firstRowKeys.find((k) => /\bqty\b|quantity/i.test(k))
+      : undefined;
+
+    logger.info('Detected column mapping', {
+      descKey, unitQtyKey, caseQtyKey, priceKey, totalKey, genericQtyKey,
+    });
+
     const items: ParsedInvoiceItem[] = [];
     for (const row of jsonRows) {
-      const keys = Object.keys(row);
-      const descKey = keys.find((k) => /desc|item|product|name/i.test(k));
-      const qtyKey = keys.find((k) => /\bqty\b|quantity/i.test(k));
-      const priceKey = keys.find((k) => /unit.?price|price.?unit|\beach\b|unit.?cost|\bprice\b|\bcost\b/i.test(k));
-      const totalKey = keys.find((k) => /\btotal\b|extended|\bamount\b|\bext\b|line.?total|row.?total/i.test(k));
-
       const item_name = descKey ? String(row[descKey]).trim() : '';
-      if (!item_name || /^(total|subtotal|tax|freight|discount)$/i.test(item_name)) continue;
+      if (!item_name) continue;
 
-      const unit_qty = qtyKey ? parseNum(row[qtyKey]) : 0;
-      const unit_price = priceKey ? parseNum(row[priceKey]) : 0;
-      const total = (totalKey ? parseNum(row[totalKey]) : 0) || unit_qty * unit_price;
+      // Skip receipt footer/summary rows: "Sub-Total", "Tax", "Total", card lines,
+      // "Previous Balance", "Balance", etc. Old regex missed "Sub-Total" (with hyphen)
+      // and card-payment lines — that's why they leaked into invoice_lines.
+      if (/^(sub[-\s]?total|tax|freight|discount|balance|previous\s+balance|amex|visa|mastercard|master\s*card|discover|change\s+due|amount\s+due|total|tender|cash)\b/i.test(item_name)) {
+        continue;
+      }
 
-      if (unit_price === 0 && total === 0) continue;
+      // Read Unit Qty and Case Qty as SEPARATE columns (both exist on RD receipts).
+      // Only one is typically non-zero per row: items sold by weight/count use Unit Qty,
+      // items sold by the case use Case Qty.
+      const unit_qty = unitQtyKey
+        ? parseNum(row[unitQtyKey])
+        : (genericQtyKey ? parseNum(row[genericQtyKey]) : 0);
+      const case_qty = caseQtyKey ? parseNum(row[caseQtyKey]) : 0;
 
-      items.push({ item_name, category: 'Other', unit_qty, case_qty: 0, unit_price, total });
+      // CRITICAL FIX: On Restaurant Depot receipts, the "Price" column is the LINE TOTAL
+      // for the row, NOT the unit price. Old code did `total = qty * unit_price`, which
+      // produced $3,168 for 40 lbs of chicken (correct total is $79.20).
+      // Rule: prefer an explicit Total/Extended column; otherwise the Price column IS
+      // the line total.
+      const priceValue = priceKey ? parseNum(row[priceKey]) : 0;
+      const explicitTotal = totalKey ? parseNum(row[totalKey]) : 0;
+      const total = explicitTotal || priceValue;
+
+      // Back-compute unit price from total ÷ effective quantity (matches Apify's format).
+      const effectiveQty = unit_qty > 0 ? unit_qty : case_qty;
+      const unit_price = effectiveQty > 0 ? total / effectiveQty : total;
+
+      // Skip fully empty rows
+      if (total === 0 && effectiveQty === 0) continue;
+
+      items.push({
+        item_name,
+        category: 'Other',
+        unit_qty,
+        case_qty,
+        unit_price,
+        total,
+      });
     }
 
     return { invoice_number, items };

@@ -19,3 +19,9 @@ logs/*
 *.log
 .DS_Store
 Thumbs.db
+
+# Local backups
+*.old
+
+# Claude Code session state
+CLAUDE.md

@@ -14,6 +14,7 @@
     "test-login": "cross-env TEST_LOGIN=true tsx src/index.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.110.8",
     "dotenv": "^16.4.5",
     "googleapis": "^144.0.0",
     "playwright": "^1.55.0",
