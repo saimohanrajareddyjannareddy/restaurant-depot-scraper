@@ -1,7 +1,8 @@
-import fs from 'node:fs';
+﻿import fs from 'node:fs';
 import path from 'node:path';
 import type { Browser, ElementHandle, Page } from 'playwright';
 import { findElement, openAuthenticatedContext, RECEIPTS_URL } from './auth.js';
+import { shouldKeepInvoice } from './cardFilter.js';
 import { config } from './config.js';
 import { type DriveClient, fileExistsInDrive, uploadToDrive, withRetry } from './drive.js';
 import {
@@ -49,14 +50,20 @@ async function findInRow(rowHandle: RowHandle, selectors: string[]): Promise<Row
 
 /**
  * Downloads one receipt row and records it (Drive upload + all Supabase writes).
- * Returns 'duplicate' if the dedup check finds it already in Drive, 'uploaded' otherwise.
+ * Returns 'duplicate' if the dedup check finds it already in Drive, 'foreign-card'
+ * if the receipt was paid on a card that isn't this restaurant's, 'uploaded' otherwise.
  *
- * The dedup check runs INSIDE this function — re-checked on every retry attempt,
- * not just once before the retry loop — so if attempt 1 somehow uploaded to Drive
+ * A 'foreign-card' receipt is still uploaded to Drive and still registered in
+ * invoice_files â€” only the invoice_headers/invoice_lines writes are gated. The
+ * card is not knowable until the parse, which happens after both of those, so
+ * gating them too would mean restructuring to download â†’ parse â†’ decide â†’ upload.
+ *
+ * The dedup check runs INSIDE this function â€” re-checked on every retry attempt,
+ * not just once before the retry loop â€” so if attempt 1 somehow uploaded to Drive
  * and then threw before finishing the Supabase writes, attempt 2 sees the file
  * already there and skips straight past re-downloading it. Combined with the fact
  * that everything after a successful Drive upload is internally non-throwing
- * (matches the reference actor — Supabase failures are logged, not fatal), a retry
+ * (matches the reference actor â€” Supabase failures are logged, not fatal), a retry
  * can never cause a duplicate Drive upload or duplicate Supabase rows.
  */
 async function downloadAndRecordReceipt(
@@ -66,16 +73,17 @@ async function downloadAndRecordReceipt(
   receiptDate: string,
   drive: DriveClient,
   restaurantId: string,
-  googleDriveFolderId: string
-): Promise<'uploaded' | 'duplicate'> {
+  googleDriveFolderId: string,
+  knownOwnerCards: string[] | null
+): Promise<'uploaded' | 'duplicate' | 'foreign-card'> {
   if (await fileExistsInDrive(drive, fileName, googleDriveFolderId)) {
-    logger.info('Already in Drive — skipping', { fileName });
+    logger.info('Already in Drive â€” skipping', { fileName });
     return 'duplicate';
   }
 
   // BASIL INDIA fix: clicking immediately after the dedup check sometimes races
   // the row's own re-render, and Playwright resolves the download against a
-  // stale target — saving to "File not found: .". Give the row a moment first.
+  // stale target â€” saving to "File not found: .". Give the row a moment first.
   await page.waitForTimeout(500);
 
   const dlBtn = await findInRow(row, [
@@ -97,7 +105,7 @@ async function downloadAndRecordReceipt(
 
   const stat = fs.statSync(localPath);
   if (stat.size === 0) {
-    throw new Error('Downloaded file is empty (0 bytes) — site may have returned an error page');
+    throw new Error('Downloaded file is empty (0 bytes) â€” site may have returned an error page');
   }
   logger.debug('Saved locally', { localPath, bytes: stat.size });
 
@@ -119,12 +127,20 @@ async function downloadAndRecordReceipt(
     restaurantId,
     stage: 'intake',
     status: 'success',
-    message: `Uploaded ${fileName} → Drive ID ${driveFile.id}`,
+    message: `Uploaded ${fileName} â†’ Drive ID ${driveFile.id}`,
   });
+
+  let outcome: 'uploaded' | 'foreign-card' = 'uploaded';
 
   try {
     const parsed = parseInvoiceExcel(localPath);
-    if (parsed && parsed.items.length > 0) {
+    if (parsed && !shouldKeepInvoice(parsed.paymentCardLast4, knownOwnerCards)) {
+      // Foreign card: the file stays in Drive and in invoice_files, but none of
+      // its invoice data lands in Supabase.
+      const invoiceRef = parsed.invoice_number ?? fileName;
+      logger.info(`skipped invoice ${invoiceRef} â€” foreign card ${parsed.paymentCardLast4}`, { fileName });
+      outcome = 'foreign-card';
+    } else if (parsed && parsed.items.length > 0) {
       logger.info(`Parsed ${parsed.items.length} line items`, { fileName, invoiceNumber: parsed.invoice_number });
 
       const { id: headerId } = await insertInvoiceHeader({
@@ -152,7 +168,7 @@ async function downloadAndRecordReceipt(
         logger.info(`Inserted invoice header + ${parsed.items.length} line items to Supabase`, { fileName });
       }
     } else {
-      logger.warn('No line items parsed from Excel — skipping invoice insert', { fileName });
+      logger.warn('No line items parsed from Excel â€” skipping invoice insert', { fileName });
     }
   } catch (parseErr) {
     logger.warn('Invoice parse/insert failed', {
@@ -161,13 +177,15 @@ async function downloadAndRecordReceipt(
     });
   }
 
+  // Remove the local temp file after upload + insert, so tmp/ doesn't
+  // grow with every run.
   try {
     fs.unlinkSync(localPath);
   } catch {
     /* cleanup best-effort */
   }
 
-  return 'uploaded';
+  return outcome;
 }
 
 /**
@@ -181,6 +199,7 @@ export async function processClient(browser: Browser, client: Restaurant, drive:
     name: restaurantName,
     rd_store_number: storeNumber,
     drive_folder_id: googleDriveFolderId,
+    known_owner_cards: knownOwnerCards,
   } = client;
 
   logger.section(`CLIENT: ${restaurantName} (id: ${restaurantId})`);
@@ -208,7 +227,7 @@ export async function processClient(browser: Browser, client: Restaurant, drive:
     }
     await screenshot(page, `${restaurantName}_receipts_page`);
 
-    // ── Set date range & click Request ──────────────────────────────────
+    // â”€â”€ Set date range & click Request â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     logger.step('Setting date range');
     const selectEl = await page.$('select').catch(() => null);
     if (selectEl) {
@@ -236,7 +255,7 @@ export async function processClient(browser: Browser, client: Restaurant, drive:
     await page.waitForTimeout(3_000);
     await screenshot(page, `${restaurantName}_receipts_table`);
 
-    // ── Collect rows ───────────────────────────────────────────────────
+    // â”€â”€ Collect rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     logger.step('Collecting receipt rows');
     const rowSelectors = [
       'tr:has(a:has-text("Download Excel"))',
@@ -263,9 +282,15 @@ export async function processClient(browser: Browser, client: Restaurant, drive:
       return summary;
     }
 
-    // ── Download & upload each receipt ────────────────────────────────
+    // â”€â”€ Download & upload each receipt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (storeNumber == null) {
-      throw new Error(`rd_store_number is null for ${restaurantName} — set it in Supabase restaurants table`);
+      throw new Error(`rd_store_number is null for ${restaurantName} â€” set it in Supabase restaurants table`);
+    }
+    // Without this, a null folder id reaches escapeDriveQueryValue (drive.ts) and
+    // surfaces as a bare "Cannot read properties of null (reading 'replace')" on
+    // every single row â€” once per receipt, twice with the retry.
+    if (googleDriveFolderId == null) {
+      throw new Error(`drive_folder_id is null for ${restaurantName} â€” set it in Supabase restaurants table`);
     }
     const targetStore = `#${storeNumber}`;
 
@@ -304,13 +329,25 @@ export async function processClient(browser: Browser, client: Restaurant, drive:
         // Dedup check lives inside downloadAndRecordReceipt (re-checked on every
         // retry attempt) rather than here, so it stays idempotent across retries.
         const result = await withRetry(
-          () => downloadAndRecordReceipt(page, row, fileName, receiptDate, drive, restaurantId, googleDriveFolderId),
+          () =>
+            downloadAndRecordReceipt(
+              page,
+              row,
+              fileName,
+              receiptDate,
+              drive,
+              restaurantId,
+              googleDriveFolderId,
+              knownOwnerCards ?? null
+            ),
           2,
           2000
         );
 
         if (result === 'duplicate') {
           summary.duplicates++;
+        } else if (result === 'foreign-card') {
+          summary.skipped++;
         } else {
           summary.uploaded++;
         }

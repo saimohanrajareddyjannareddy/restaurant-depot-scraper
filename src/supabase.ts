@@ -7,7 +7,19 @@ export interface Restaurant {
   rd_email: string;
   rd_password: string | null;
   rd_store_number: string | number | null;
-  drive_folder_id: string;
+  /**
+   * Nullable in the DB — turmeric-street style has it unset. A null reaches
+   * escapeDriveQueryValue (drive.ts) as `null.replace(...)`, so processClient
+   * fails fast on it with an actionable message instead.
+   */
+  drive_folder_id: string | null;
+  /**
+   * Card last-4s belonging to this restaurant, used to drop receipts paid on a
+   * foreign card (see cardFilter.ts). Already returned by fetchActiveRestaurants —
+   * that query has no `select=`, so PostgREST sends every column; this field only
+   * makes it visible to TypeScript. Null/empty turns the filter off.
+   */
+  known_owner_cards: string[] | null;
 }
 
 type SupabaseMethod = 'GET' | 'POST' | 'PATCH' | 'DELETE';

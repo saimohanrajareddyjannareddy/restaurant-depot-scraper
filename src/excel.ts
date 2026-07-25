@@ -9,8 +9,12 @@ import XLSX from 'xlsx';
 import { categorize } from './categorize.js';
 import { logger } from './logger.js';
 
-/** Format any date string to YYYY-MM-DD. */
-export function formatDate(rawDate: string): string {
+/**
+ * Format any date string to YYYY-MM-DD. Null/empty in → empty string out, so a
+ * missing cell can't blow up on `.replace` further down.
+ */
+export function formatDate(rawDate: string | null | undefined): string {
+  if (!rawDate) return '';
   const d = new Date(rawDate);
   if (!isNaN(d.getTime())) return d.toISOString().split('T')[0]!;
 
@@ -28,7 +32,9 @@ export function formatDate(rawDate: string): string {
  *   totalToFilenameSegment('-$64.89')    // "-64-89"
  *   totalToFilenameSegment('$1,507.64')  // "1507-64"
  */
-export function totalToFilenameSegment(totalStr: string): string {
+export function totalToFilenameSegment(totalStr: string | null | undefined): string {
+  // '0-00' matches the caller's own default when no total cell is present.
+  if (!totalStr) return '0-00';
   return totalStr.replace(/[$,\s]/g, '').replace(/\./g, '-');
 }
 
@@ -62,7 +68,43 @@ export interface ParsedInvoiceItem {
 
 export interface ParsedInvoice {
   invoice_number: string | null;
+  /**
+   * Last 4 digits of the card the receipt was paid with, from the "AMEX 2063" /
+   * "VISA 1030" payment row — null when the receipt has no card row (cash) or
+   * the digits couldn't be read. Consumed by shouldKeepInvoice (see cardFilter.ts),
+   * which deliberately keeps the invoice when this is null.
+   */
+  paymentCardLast4: string | null;
   items: ParsedInvoiceItem[];
+}
+
+/** Payment rows we harvest the card number from before discarding them. */
+const CARD_LINE_RE = /^(amex|visa|mastercard|master\s*card|discover)\b/i;
+
+/**
+ * Pull the bare last-4 out of a payment row.
+ *
+ * UNVERIFIED LAYOUT: we have never seen a real receipt's payment row, so we do
+ * not know whether the digits share the description cell ("AMEX 2063") or sit in
+ * a separate column. This handles both:
+ *   1. trailing digits in the description cell, incl. masked forms
+ *      ("AMEX 2063", "VISA ....1030", "AMEX XXXX-2063")
+ *   2. otherwise, a sibling cell that is *only* a 4-digit group (optionally
+ *      mask-prefixed). Requiring the whole cell to match keeps dollar amounts
+ *      ("1234.56") and quantities from being mistaken for a card number.
+ * Returns null rather than guessing — a null keeps the invoice, so a miss here
+ * is non-destructive.
+ */
+function extractCardLast4(itemName: string, row: Record<string, unknown>): string | null {
+  const sameCell = itemName.match(/(\d{4})\s*$/);
+  if (sameCell) return sameCell[1]!;
+
+  for (const value of Object.values(row)) {
+    const cell = String(value ?? '').trim();
+    const m = cell.match(/^[*xX#•.\s-]*(\d{4})$/);
+    if (m) return m[1]!;
+  }
+  return null;
 }
 
 export function parseInvoiceExcel(localPath: string): ParsedInvoice | null {
@@ -125,9 +167,22 @@ export function parseInvoiceExcel(localPath: string): ParsedInvoice | null {
     });
 
     const items: ParsedInvoiceItem[] = [];
+    let paymentCardLast4: string | null = null;
     for (const row of jsonRows) {
       const item_name = descKey ? String(row[descKey]).trim() : '';
       if (!item_name) continue;
+
+      // Card payment row: harvest the last-4 on the way past, then discard the
+      // row as before (it is not a line item). The general footer regex below
+      // also matches these — that stays as a backstop and is left untouched.
+      // First card row wins; a split-tender receipt keeps only the first card.
+      if (CARD_LINE_RE.test(item_name)) {
+        if (paymentCardLast4 === null) {
+          paymentCardLast4 = extractCardLast4(item_name, row);
+          logger.debug('Payment card row', { item_name, paymentCardLast4 });
+        }
+        continue;
+      }
 
       // Skip receipt footer/summary rows: "Sub-Total", "Tax", "Total", card lines,
       // "Previous Balance", "Balance", etc. Old regex missed "Sub-Total" (with hyphen)
@@ -170,7 +225,7 @@ export function parseInvoiceExcel(localPath: string): ParsedInvoice | null {
       });
     }
 
-    return { invoice_number, items };
+    return { invoice_number, paymentCardLast4, items };
   } catch (err) {
     logger.warn('Excel parse failed', { error: err instanceof Error ? err.message : String(err) });
     return null;
