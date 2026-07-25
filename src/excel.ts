@@ -6,6 +6,7 @@
 // user-supplied or otherwise untrusted input. Do not repurpose parseInvoiceExcel
 // to parse files from any other source without re-evaluating this tradeoff.
 import XLSX from 'xlsx';
+import { categorize } from './categorize.js';
 import { logger } from './logger.js';
 
 /** Format any date string to YYYY-MM-DD. */
@@ -161,7 +162,7 @@ export function parseInvoiceExcel(localPath: string): ParsedInvoice | null {
 
       items.push({
         item_name,
-        category: 'Other',
+        category: categorize(item_name),
         unit_qty,
         case_qty,
         unit_price,
